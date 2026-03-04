@@ -7,6 +7,8 @@ namespace Pest\Browser\Drivers;
 use Amp\ByteStream\ReadableResourceStream;
 use Amp\Http\Cookie\RequestCookie;
 use Amp\Http\Server\DefaultErrorHandler;
+use Amp\Http\Server\FormParser\BufferedFile;
+use Amp\Http\Server\FormParser\FormParser;
 use Amp\Http\Server\HttpServer as AmpHttpServer;
 use Amp\Http\Server\HttpServerStatus;
 use Amp\Http\Server\Request as AmpRequest;
@@ -17,7 +19,9 @@ use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Http\Kernel as HttpKernel;
 use Illuminate\Foundation\Testing\Concerns\WithoutExceptionHandlingHandler;
 use Illuminate\Http\Request;
+use Illuminate\Http\UploadedFile;
 use Illuminate\Routing\UrlGenerator;
+use Illuminate\Support\Arr;
 use Illuminate\Support\Uri;
 use Pest\Browser\Contracts\HttpServer;
 use Pest\Browser\Exceptions\ServerNotFoundException;
@@ -27,6 +31,8 @@ use Pest\Browser\Playwright\Playwright;
 use Psr\Log\NullLogger;
 use Symfony\Component\Mime\MimeTypes;
 use Throwable;
+
+use function Amp\Http\Server\FormParser\parseContentBoundary;
 
 /**
  * @internal
@@ -240,21 +246,31 @@ final class LaravelHttpServer implements HttpServer
         $contentType = $request->getHeader('content-type') ?? '';
         $method = mb_strtoupper($request->getMethod());
         $rawBody = (string) $request->getBody();
-        $parameters = [];
-        if ($method !== 'GET' && str_starts_with(mb_strtolower($contentType), 'application/x-www-form-urlencoded')) {
-            parse_str($rawBody, $parameters);
-        }
-        $cookies = array_map(fn (RequestCookie $cookie): string => urldecode($cookie->getValue()), $request->getCookies());
-        $cookies = array_merge($cookies, test()->prepareCookiesForRequest()); // @phpstan-ignore-line
         /** @var array<string, string> $serverVariables */
         $serverVariables = test()->serverVariables(); // @phpstan-ignore-line
+
+        $parameters = [];
+        $files = [];
+        if ($method !== 'GET' && str_starts_with(mb_strtolower($contentType), 'application/x-www-form-urlencoded')) {
+            parse_str($rawBody, $parameters);
+        } elseif ($method !== 'GET' && str_starts_with($contentType, 'multipart/form-data')) {
+            $parsedForm = $this->parseMultipartForm($rawBody, $contentType);
+            $parameters = $parsedForm['parameters'];
+            $files = $parsedForm['files'];
+
+            // Ensure that Content-Type in $_SERVER is consistent with header
+            $serverVariables['CONTENT_TYPE'] = $contentType;
+        }
+
+        $cookies = array_map(fn (RequestCookie $cookie): string => urldecode($cookie->getValue()), $request->getCookies());
+        $cookies = array_merge($cookies, test()->prepareCookiesForRequest()); // @phpstan-ignore-line
 
         $symfonyRequest = Request::create(
             $absoluteUrl,
             $method,
             $parameters,
             $cookies,
-            [], // @TODO files...
+            $files,
             $serverVariables,
             $rawBody
         );
@@ -361,5 +377,32 @@ final class LaravelHttpServer implements HttpServer
         }
 
         return str_replace($this->originalAssetUrl, $this->url(), $content);
+    }
+
+    /**
+     * @return array[]
+     *
+     * @throws \Amp\Http\Server\HttpErrorException
+     */
+    private function parseMultipartForm(string $rawBody, string $contentType): array
+    {
+        $parameters = [];
+        $form = new FormParser()->parseMultipartBody($rawBody, parseContentBoundary($contentType));
+        foreach ($form->getValues() as $key => $value) {
+            parse_str($key.'='.urlencode($value[0] ?? ''), $parsed);
+            $parameters = array_replace_recursive($parameters, $parsed);
+        }
+
+        $files = Arr::mapWithKeys(
+            Arr::flatten($form->getFiles()),
+            function (BufferedFile $file, string $key) {
+                $path = tempnam(sys_get_temp_dir(), 'img_');
+                file_put_contents($path, $file->getContents());
+
+                return [$key => new UploadedFile($path, $file->getName(), $file->getMimeType(), UPLOAD_ERR_OK, true)];
+            }
+        );
+
+        return compact('parameters', 'files');
     }
 }
